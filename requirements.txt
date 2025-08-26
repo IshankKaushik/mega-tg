@@ -1,0 +1,14 @@
+python-telegram-bot
+instaloader
+aiohttp
+beautifulsoup4
+hachoir
+numpy
+Pillow
+git+https://github.com/pyrogram/pyrogram
+requests
+tgcrypto
+python-dotenv
+feedparser
+filesplit
+git+https://github.com/odwyersoftware/mega.py
