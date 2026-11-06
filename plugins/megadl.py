@@ -261,11 +261,11 @@ async def process_mega_download(bot, update, url, user_id):
     tmp_directory = None
     
     try:
-        # Send processing message
+        # Send processing message (FIXED HERE: changed update.message_id to update.id)
         usermsg = await bot.send_message(
             chat_id=update.chat.id,
             text=Translation.INFO_PROCESSING,
-            reply_to_message_id=update.message_id
+            reply_to_message_id=update.id
         )
         
         # Get file information
