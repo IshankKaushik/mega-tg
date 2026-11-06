@@ -48,83 +48,73 @@ class MegaDownloader:
     def __init__(self):
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
     
+    def _get_info_with_mega_py(self, url):
+        """Get file info using mega.py (runs in background thread to prevent freezing)"""
+        try:
+            from mega import Mega
+            mega = Mega()
+            public_mega = mega.login()
+            file_info = public_mega.get_public_url_info(url)
+            
+            if file_info and isinstance(file_info, str) and "|" in file_info:
+                parts = file_info.split("|")
+                if len(parts) >= 2:
+                    return {
+                        'size': int(parts[0]),
+                        'name': parts[1],
+                        'success': True
+                    }
+        except ImportError:
+            logger.warning("Mega library not available, using alternative method")
+        except Exception as e:
+            logger.warning(f"Mega library failed: {e}")
+        return {'success': False}
+
     async def get_mega_info(self, url):
         """Get mega file information"""
+        loop = get_running_loop()
+        
+        # 1. Try mega.py library first (in a background thread)
         try:
-            # Try to import mega library
-            try:
-                from mega import Mega
-                mega = Mega()
-                public_mega = mega.login()
-                file_info = public_mega.get_public_url_info(url)
-                
-                if file_info and isinstance(file_info, str) and "|" in file_info:
-                    parts = file_info.split("|")
-                    if len(parts) >= 2:
-                        return {
-                            'size': int(parts[0]),
-                            'name': parts[1],
-                            'success': True
-                        }
-                
-            except ImportError:
-                logger.warning("Mega library not available, using alternative method")
-            except Exception as e:
-                logger.warning(f"Mega library failed: {e}")
-            
-            # Fallback: try to get info using megatools
-            try:
-                loop = get_running_loop()
-                result = await loop.run_in_executor(
-                    self.executor,
-                    self._get_info_with_megatools,
-                    url
-                )
+            result = await loop.run_in_executor(self.executor, self._get_info_with_mega_py, url)
+            if result.get('success'):
                 return result
-            except Exception as e:
-                logger.error(f"Failed to get file info: {e}")
-                return {'success': False, 'error': str(e)}
-                
         except Exception as e:
-            logger.error(f"Error getting mega info: {e}")
+            logger.error(f"Failed to get info with mega.py: {e}")
+        
+        # 2. Fallback: try to get info using megatools
+        try:
+            result = await loop.run_in_executor(
+                self.executor,
+                self._get_info_with_megatools,
+                url
+            )
+            return result
+        except Exception as e:
+            logger.error(f"Failed to get file info with megatools: {e}")
             return {'success': False, 'error': str(e)}
     
     def _get_info_with_megatools(self, url):
         """Get file info using megatools"""
         try:
+            # Increased timeout from 30 to 120 seconds
             result = subprocess.run(
                 ["megadl", "--print-names", "--no-progress", url],
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=120
             )
             
             if result.returncode == 0 and result.stdout:
-                # Parse output to get filename
                 lines = result.stdout.strip().split('\n')
                 if lines:
                     filename = lines[-1].strip()
                     if filename:
-                        # Try to get file size
-                        try:
-                            size_result = subprocess.run(
-                                ["megadl", "--print-names", "--no-progress", "--dry-run", url],
-                                capture_output=True,
-                                text=True,
-                                timeout=30
-                            )
-                            # This is a simplified approach - in practice you might need to parse the output differently
-                            return {
-                                'name': filename,
-                                'size': 0,  # Size detection would need more sophisticated parsing
-                                'success': True
-                            }
-                        except:
-                            return {
-                                'name': filename,
-                                'size': 0,
-                                'success': True
-                            }
+                        return {
+                            'name': filename,
+                            'size': 0,
+                            'success': True
+                        }
             
             return {'success': False, 'error': 'Could not get file information'}
             
@@ -214,37 +204,29 @@ async def mega_dl(bot, update):
     user_id = update.from_user.id
     
     try:
-        # Check blacklist
         if check_blacklist(user_id):
             await update.reply_text("❌ Sorry! You are banned from using this bot!")
             return
         
-        # Add user to database
         add_chat(user_id)
-        
         url = update.text.strip()
         
-        # Check if it's a mega.nz link
         if "mega.nz" not in url.lower():
             await update.reply_text(Translation.ERROR_NOT_MEGA_LINK)
             return
         
-        # Check if it's a folder link
         if any(x in url for x in ["folder", "#F", "#N"]):
             await update.reply_text(Translation.ERROR_FOLDER_NOT_SUPPORTED)
             return
         
-        # Check if user has active download
         if user_id in active_downloads:
             await update.reply_text(
                 "⚠️ You already have an active download! Please wait for it to complete."
             )
             return
         
-        # Acquire semaphore for concurrent download limit
         async with download_semaphore:
             active_downloads[user_id] = True
-            
             try:
                 await process_mega_download(bot, update, url, user_id)
             finally:
@@ -261,14 +243,12 @@ async def process_mega_download(bot, update, url, user_id):
     tmp_directory = None
     
     try:
-        # Send processing message (FIXED HERE: changed update.message_id to update.id)
         usermsg = await bot.send_message(
             chat_id=update.chat.id,
             text=Translation.INFO_PROCESSING,
-            reply_to_message_id=update.id
+            reply_to_message_id=update.id  # FIXED
         )
         
-        # Get file information
         file_info = await mega_downloader.get_mega_info(url)
         
         if not file_info.get('success'):
@@ -279,17 +259,10 @@ async def process_mega_download(bot, update, url, user_id):
         
         filename = file_info.get('name', 'unknown_file')
         filesize = file_info.get('size', 0)
-        
-        # Determine file type
         tg_send_type = "vid" if any(ext in filename.lower() for ext in ['.mp4', '.mkv', '.avi', '.mov']) else "doc"
-        
-        # Create description
         description = os.path.splitext(filename)[0] if '.' in filename else filename
-        
-        # Check user permissions
         is_auth_user = user_id == int(Config.OWNER_ID) or user_id in Config.AUTH_USERS
         
-        # Setup directories
         if is_auth_user:
             admin_dir_name = str(int(time.time()))
             tmp_directory = os.path.join(Config.ADMIN_LOCATION, str(user_id), admin_dir_name)
@@ -302,18 +275,15 @@ async def process_mega_download(bot, update, url, user_id):
         thumb_image_path = os.path.join(Config.DOWNLOAD_LOCATION, f"{user_id}.jpg")
         cred_location = os.path.join(Config.CREDENTIALS_LOCATION, "mega.ini")
         
-        # Update status
         await usermsg.edit_text(
             f"<b>📁 File detected:</b> {filename}\n"
             f"<b>📊 Size:</b> {humanbytes(filesize) if filesize > 0 else 'Unknown'}\n\n"
             f"{Translation.DOWNLOAD_START}"
         )
         
-        # Start download
         start_time = datetime.now()
         download_success = False
         
-        # Try MEGAcmd first, then fallback to megatools
         try:
             await mega_downloader.download_with_megacmd(url, tmp_directory)
             download_success = True
@@ -333,12 +303,10 @@ async def process_mega_download(bot, update, url, user_id):
             await usermsg.edit_text(Translation.ERROR_DOWNLOAD_FAILED)
             return
         
-        # Get actual file size
         actual_size = os.path.getsize(download_path)
         end_download = datetime.now()
         download_time = (end_download - start_time).seconds
         
-        # Check if file needs splitting
         if actual_size > Config.MAX_FILE_SIZE:
             await handle_large_file(
                 bot, update, usermsg, download_path, tmp_directory, 
@@ -356,7 +324,6 @@ async def process_mega_download(bot, update, url, user_id):
         if usermsg:
             await usermsg.edit_text(f"{Translation.ERROR_PROCESSING}\n\nError: {str(e)}")
     finally:
-        # Cleanup
         if tmp_directory and os.path.exists(tmp_directory):
             try:
                 shutil.rmtree(tmp_directory)
@@ -371,11 +338,9 @@ async def handle_large_file(bot, update, usermsg, download_path, tmp_directory, 
             f"{Translation.INFO_SPLITTING_FILE}"
         )
         
-        # Create split directory
         split_directory = os.path.join(tmp_directory, "split")
         os.makedirs(split_directory, exist_ok=True)
         
-        # Split file
         if tg_send_type == "vid":
             await split_video_files(download_path, Config.SPLIT_SIZE, split_directory, filename)
         else:
@@ -388,15 +353,13 @@ async def handle_large_file(bot, update, usermsg, download_path, tmp_directory, 
                 split_directory
             )
         
-        # Upload split files
         split_files_list = []
         for root, dirs, files in os.walk(split_directory):
             for file in files:
-                if file != "fs_manifest.csv":  # Skip manifest file
+                if file != "fs_manifest.csv":
                     split_files_list.append(os.path.join(root, file))
         
-        split_files_list.sort()  # Ensure proper order
-        
+        split_files_list.sort()
         upload_start = datetime.now()
         
         for i, split_file in enumerate(split_files_list, 1):
@@ -428,7 +391,6 @@ async def handle_normal_file(bot, update, usermsg, download_path, tmp_directory,
     """Handle normal sized files"""
     try:
         await usermsg.edit_text(Translation.UPLOAD_START)
-        
         upload_start = datetime.now()
         
         await send_file(
