@@ -50,7 +50,7 @@ class MegaDownloader:
     def _get_info_sync(self, url):
         try:
             from mega import Mega
-            m = Mega().login() # Logs in anonymously if no credentials provided
+            m = Mega().login()
             file_info = m.get_public_url_info(url)
             if file_info and 'size' in file_info and 'name' in file_info:
                 return {
@@ -67,14 +67,18 @@ class MegaDownloader:
         loop = get_running_loop()
         try:
             from mega import Mega
-            # If Mega credentials are set in env, use them to bypass limits
-            m = Mega().login(Config.Mega_email, Config.Mega_password) if Config.Mega_email else Mega().login()
+            
+            # USE MEGA CREDENTIALS TO BYPASS 500KB/s SPEED LIMIT
+            if Config.Mega_email and Config.Mega_email != "None":
+                m = Mega().login(Config.Mega_email, Config.Mega_password)
+            else:
+                m = Mega().login()
+                
             file_info = m.get_public_url_info(url)
             download_url = m.get_download_url(file_info)
             
             file_path = os.path.join(download_dir, file_info['name'])
             
-            # Use requests to stream and update progress
             with requests.get(download_url, stream=True, timeout=300) as r:
                 r.raise_for_status()
                 total_size = int(r.headers.get('content-length', 0))
@@ -82,12 +86,11 @@ class MegaDownloader:
                 last_update_time = time.time()
                 
                 with open(file_path, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=1024*1024): # 1MB chunks
+                    for chunk in r.iter_content(chunk_size=1024*1024):
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
                             
-                            # Update every 5 seconds
                             if time.time() - last_update_time > 5:
                                 percentage = (downloaded / total_size) * 100 if total_size > 0 else 0
                                 speed = downloaded / (time.time() - start_time)
@@ -154,15 +157,12 @@ async def process_mega_download(bot, update, url, user_id):
         filename = file_info.get('name', 'unknown_file')
         filesize = file_info.get('size', 0)
         
-        # Create temp directory
         tmp_directory = os.path.join(Config.DOWNLOAD_LOCATION, str(user_id))
         os.makedirs(tmp_directory, exist_ok=True)
         
         await usermsg.edit_text(f"📁 **File:** {filename}\n📊 **Size:** {humanbytes(filesize)}\n\n⏳ Starting download...")
         
         start_time = time.time()
-        
-        # Download with live progress
         download_path = await mega_downloader.download_with_progress(url, tmp_directory, usermsg, start_time)
         
         if not os.path.exists(download_path):
@@ -171,7 +171,7 @@ async def process_mega_download(bot, update, url, user_id):
         
         actual_size = os.path.getsize(download_path)
         
-        # Check if file needs splitting
+        # If file is larger than 2GB, split it into playable parts
         if actual_size > Config.MAX_FILE_SIZE:
             await handle_large_file(bot, update, usermsg, download_path, tmp_directory, filename, actual_size)
         else:
@@ -190,28 +190,36 @@ async def process_mega_download(bot, update, url, user_id):
 
 async def handle_large_file(bot, update, usermsg, download_path, tmp_directory, filename, file_size):
     try:
-        await usermsg.edit_text(f"✂️ **File is larger than 2GB.**\nSplitting into parts...")
+        await usermsg.edit_text(f"✂️ **File is larger than 2GB.**\nCutting into playable video parts using FFmpeg...")
+        
         split_directory = os.path.join(tmp_directory, "split")
         os.makedirs(split_directory, exist_ok=True)
         
-        # Split the file (keep extension)
-        # Using split_files from your repo, ensure it splits correctly
+        # Determine file type
+        tg_send_type = "vid" if any(ext in filename.lower() for ext in ['.mp4', '.mkv', '.avi', '.mov']) else "doc"
+        
         loop = get_running_loop()
-        await loop.run_in_executor(None, split_files, download_path, Config.SPLIT_SIZE, split_directory)
+        
+        if tg_send_type == "vid":
+            # Use your custom split_video_files function
+            await split_video_files(download_path, Config.SPLIT_SIZE, split_directory, filename)
+        else:
+            # Fallback to raw split for non-videos (like zips)
+            await loop.run_in_executor(None, split_files, download_path, Config.SPLIT_SIZE, split_directory)
         
         # Get list of split files
-        split_files_list = sorted([os.path.join(split_directory, f) for f in os.listdir(split_directory)])
+        split_files_list = []
+        for f in os.listdir(split_directory):
+            if f != "fs_manifest.csv":
+                split_files_list.append(os.path.join(split_directory, f))
+        split_files_list.sort()
         
         for i, split_file in enumerate(split_files_list, 1):
-            part_name = f"{filename}.part{i}"
-            # Rename to keep extension (e.g., video.mp4.part1)
-            new_path = os.path.join(split_directory, part_name)
-            os.rename(split_file, new_path)
+            part_name = os.path.basename(split_file)
+            await usermsg.edit_text(f"🚀 Uploading part {i}/{len(split_files_list)}: {part_name}...")
             
-            await usermsg.edit_text(f"🚀 Uploading part {i}/{len(split_files_list)}...")
-            
-            # Upload with progress
-            await send_splitted_file(bot, update, "doc", None, new_path, tmp_directory, part_name, usermsg)
+            # Upload as video (if it's a video) or document
+            await send_splitted_file(bot, update, tg_send_type, None, split_file, tmp_directory, part_name, usermsg)
             
         await usermsg.edit_text("🎉 All parts uploaded successfully!")
     except Exception as e:
@@ -220,8 +228,9 @@ async def handle_large_file(bot, update, usermsg, download_path, tmp_directory, 
 
 async def handle_normal_file(bot, update, usermsg, download_path, tmp_directory, filename):
     try:
+        tg_send_type = "vid" if any(ext in filename.lower() for ext in ['.mp4', '.mkv', '.avi', '.mov']) else "doc"
         await usermsg.edit_text("🚀 Uploading to Telegram...")
-        await send_file(bot, update, "doc", None, download_path, tmp_directory, filename, usermsg)
+        await send_file(bot, update, tg_send_type, None, download_path, tmp_directory, filename, usermsg)
         await usermsg.edit_text("🎉 File uploaded successfully!")
     except Exception as e:
         logger.error(f"Normal file error: {e}")
