@@ -1,17 +1,19 @@
 import logging
 import asyncio
+import subprocess
 import os
 import shutil
 import time
 from datetime import datetime
 from asyncio import get_running_loop
 import concurrent.futures
+import requests
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
 # Import helpers
-from helpers.download_uplaod_helper import send_splitted_file, send_file, humanbytes
+from helpers.download_uplaod_helper import send_splitted_file, send_file, humanbytes, progress_for_pyrogram, TimeFormatter
 from helpers.files_spliiting import split_files, split_video_files
 
 # Import configuration
@@ -25,51 +27,30 @@ from translation import Translation
 import pyrogram
 from pyrogram import Client, filters
 
-# Set pyrogram logging level
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
-# Import database functions
 from database.blacklist import check_blacklist
 from database.userchats import add_chat
 
-# Global variables for download management
 active_downloads = {}
 download_semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_DOWNLOADS)
 
 class MegaDownloader:
-    """Reliable Mega downloader using pure Python (mega.py)"""
-    
     def __init__(self):
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
     
     async def get_mega_info(self, url):
-        """Get mega file information using mega.py with a 45s timeout"""
         loop = get_running_loop()
-        max_retries = 3
-        
-        for attempt in range(max_retries):
-            try:
-                # Run mega.py in the background with a strict timeout
-                result = await asyncio.wait_for(
-                    loop.run_in_executor(self.executor, self._get_info_sync, url),
-                    timeout=45.0
-                )
-                if result.get('success'):
-                    return result
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout fetching info on attempt {attempt + 1}")
-            except Exception as e:
-                logger.error(f"Error fetching info on attempt {attempt + 1}: {e}")
-            
-            await asyncio.sleep(2)
-            
-        return {'success': False, 'error': 'Mega API is taking too long to respond. Try again later.'}
+        try:
+            result = await loop.run_in_executor(self.executor, self._get_info_sync, url)
+            return result
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
     
     def _get_info_sync(self, url):
-        """Synchronous mega.py call (runs in thread)"""
         try:
             from mega import Mega
-            m = Mega().login()
+            m = Mega().login() # Logs in anonymously if no credentials provided
             file_info = m.get_public_url_info(url)
             if file_info and 'size' in file_info and 'name' in file_info:
                 return {
@@ -80,50 +61,72 @@ class MegaDownloader:
         except Exception as e:
             logger.error(f"mega.py info error: {e}")
         return {'success': False, 'error': 'mega.py failed'}
-    
-    async def download_with_mega_py(self, url, download_dir):
-        """Download using mega.py"""
-        try:
-            loop = get_running_loop()
-            await loop.run_in_executor(
-                self.executor,
-                self._download_sync,
-                url,
-                download_dir
-            )
-            return True
-        except Exception as e:
-            logger.error(f"mega.py download failed: {e}")
-            raise
-    
-    def _download_sync(self, url, download_dir):
-        """Synchronous mega.py download (runs in thread)"""
-        from mega import Mega
-        m = Mega().login()
-        # mega.py will download into download_dir and return the file path
-        m.download_url(url, dest_path=download_dir)
 
-# Global downloader instance
+    async def download_with_progress(self, url, download_dir, message, start_time):
+        """Streams the download and updates Telegram message"""
+        loop = get_running_loop()
+        try:
+            from mega import Mega
+            # If Mega credentials are set in env, use them to bypass limits
+            m = Mega().login(Config.Mega_email, Config.Mega_password) if Config.Mega_email else Mega().login()
+            file_info = m.get_public_url_info(url)
+            download_url = m.get_download_url(file_info)
+            
+            file_path = os.path.join(download_dir, file_info['name'])
+            
+            # Use requests to stream and update progress
+            with requests.get(download_url, stream=True, timeout=300) as r:
+                r.raise_for_status()
+                total_size = int(r.headers.get('content-length', 0))
+                downloaded = 0
+                last_update_time = time.time()
+                
+                with open(file_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=1024*1024): # 1MB chunks
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            
+                            # Update every 5 seconds
+                            if time.time() - last_update_time > 5:
+                                percentage = (downloaded / total_size) * 100 if total_size > 0 else 0
+                                speed = downloaded / (time.time() - start_time)
+                                eta = (total_size - downloaded) / speed if speed > 0 else 0
+                                
+                                progress_str = f"📥 **Downloading...**\n\n"
+                                progress_str += f"**Progress:** {percentage:.1f}%\n"
+                                progress_str += f"**Size:** {humanbytes(downloaded)} / {humanbytes(total_size)}\n"
+                                progress_str += f"**Speed:** {humanbytes(speed)}/s\n"
+                                progress_str += f"**ETA:** {TimeFormatter(eta)}"
+                                
+                                try:
+                                    await message.edit_text(progress_str)
+                                except Exception:
+                                    pass
+                                last_update_time = time.time()
+            return file_path
+        except Exception as e:
+            logger.error(f"Download failed: {e}")
+            raise
+
 mega_downloader = MegaDownloader()
 
 @Client.on_message(filters.regex(pattern=".*http.*"))
 async def mega_dl(bot, update):
-    """Main mega download handler"""
     user_id = update.from_user.id
     try:
         if check_blacklist(user_id):
-            await update.reply_text("❌ Sorry! You are banned from using this bot!")
+            await update.reply_text("❌ Sorry! You are banned.")
             return
         add_chat(user_id)
         url = update.text.strip()
+        
         if "mega.nz" not in url.lower():
-            await update.reply_text(Translation.ERROR_NOT_MEGA_LINK)
+            await update.reply_text("❌ Invalid link. Please send a Mega.nz link.")
             return
-        if any(x in url for x in ["folder", "#F", "#N"]):
-            await update.reply_text(Translation.ERROR_FOLDER_NOT_SUPPORTED)
-            return
+            
         if user_id in active_downloads:
-            await update.reply_text("⚠️ You already have an active download! Please wait for it to complete.")
+            await update.reply_text("⚠️ You already have an active download!")
             return
         
         async with download_semaphore:
@@ -134,113 +137,92 @@ async def mega_dl(bot, update):
                 active_downloads.pop(user_id, None)
                 
     except Exception as e:
-        logger.error(f"Error in mega_dl for user {user_id}: {e}")
-        await update.reply_text(f"❌ An unexpected error occurred: {str(e)}")
-        active_downloads.pop(user_id, None)
+        logger.error(f"Error: {e}")
+        await update.reply_text(f"❌ Error: {str(e)}")
 
 async def process_mega_download(bot, update, url, user_id):
-    """Process mega download"""
     usermsg = None
     tmp_directory = None
     try:
-        usermsg = await bot.send_message(
-            chat_id=update.chat.id,
-            text=Translation.INFO_PROCESSING,
-            reply_to_message_id=update.id
-        )
+        usermsg = await bot.send_message(chat_id=update.chat.id, text="🔍 Fetching file info...", reply_to_message_id=update.id)
         
-        # 1. Get Info
         file_info = await mega_downloader.get_mega_info(url)
         if not file_info.get('success'):
-            await usermsg.edit_text(f"{Translation.ERROR_INVALID_LINK}\n\nError: {file_info.get('error', 'Unknown error')}")
+            await usermsg.edit_text(f"❌ Failed to get file info. Error: {file_info.get('error')}")
             return
         
         filename = file_info.get('name', 'unknown_file')
         filesize = file_info.get('size', 0)
-        tg_send_type = "vid" if any(ext in filename.lower() for ext in ['.mp4', '.mkv', '.avi', '.mov']) else "doc"
-        description = os.path.splitext(filename)[0] if '.' in filename else filename
-        is_auth_user = user_id == int(Config.OWNER_ID) or user_id in Config.AUTH_USERS
         
-        if is_auth_user:
-            admin_dir_name = str(int(time.time()))
-            tmp_directory = os.path.join(Config.ADMIN_LOCATION, str(user_id), admin_dir_name)
-        else:
-            tmp_directory = os.path.join(Config.DOWNLOAD_LOCATION, str(user_id))
-        
+        # Create temp directory
+        tmp_directory = os.path.join(Config.DOWNLOAD_LOCATION, str(user_id))
         os.makedirs(tmp_directory, exist_ok=True)
-        download_path = os.path.join(tmp_directory, filename)
-        thumb_image_path = os.path.join(Config.DOWNLOAD_LOCATION, f"{user_id}.jpg")
         
-        await usermsg.edit_text(f"<b>📁 File detected:</b> {filename}\n<b>📊 Size:</b> {humanbytes(filesize) if filesize > 0 else 'Unknown'}\n\n{Translation.DOWNLOAD_START}")
+        await usermsg.edit_text(f"📁 **File:** {filename}\n📊 **Size:** {humanbytes(filesize)}\n\n⏳ Starting download...")
         
-        start_time = datetime.now()
+        start_time = time.time()
         
-        # 2. Download (using mega.py)
-        await mega_downloader.download_with_mega_py(url, tmp_directory)
+        # Download with live progress
+        download_path = await mega_downloader.download_with_progress(url, tmp_directory, usermsg, start_time)
         
         if not os.path.exists(download_path):
-            await usermsg.edit_text(Translation.ERROR_DOWNLOAD_FAILED)
+            await usermsg.edit_text("❌ Download failed. File not found.")
             return
         
         actual_size = os.path.getsize(download_path)
-        end_download = datetime.now()
-        download_time = (end_download - start_time).seconds
         
-        # 3. Upload / Split
+        # Check if file needs splitting
         if actual_size > Config.MAX_FILE_SIZE:
-            await handle_large_file(bot, update, usermsg, download_path, tmp_directory, filename, tg_send_type, thumb_image_path, description, actual_size, download_time)
+            await handle_large_file(bot, update, usermsg, download_path, tmp_directory, filename, actual_size)
         else:
-            await handle_normal_file(bot, update, usermsg, download_path, tmp_directory, tg_send_type, thumb_image_path, description, download_time)
+            await handle_normal_file(bot, update, usermsg, download_path, tmp_directory, filename)
             
     except Exception as e:
-        logger.error(f"Error processing download for user {user_id}: {e}")
+        logger.error(f"Error processing: {e}")
         if usermsg:
-            await usermsg.edit_text(f"{Translation.ERROR_PROCESSING}\n\nError: {str(e)}")
+            await usermsg.edit_text(f"❌ Error: {str(e)}")
     finally:
         if tmp_directory and os.path.exists(tmp_directory):
             try:
                 shutil.rmtree(tmp_directory)
-            except Exception as e:
-                logger.warning(f"Could not cleanup directory {tmp_directory}: {e}")
+            except Exception:
+                pass
 
-# ... (Keep handle_large_file and handle_normal_file exactly as they are) ...
-async def handle_large_file(bot, update, usermsg, download_path, tmp_directory, filename, tg_send_type, thumb_image_path, description, file_size, download_time):
+async def handle_large_file(bot, update, usermsg, download_path, tmp_directory, filename, file_size):
     try:
-        await usermsg.edit_text(f"<b>📊 Detected Size:</b> {humanbytes(file_size)}\n\n{Translation.INFO_SPLITTING_FILE}")
+        await usermsg.edit_text(f"✂️ **File is larger than 2GB.**\nSplitting into parts...")
         split_directory = os.path.join(tmp_directory, "split")
         os.makedirs(split_directory, exist_ok=True)
-        if tg_send_type == "vid":
-            await split_video_files(download_path, Config.SPLIT_SIZE, split_directory, filename)
-        else:
-            loop = get_running_loop()
-            await loop.run_in_executor(None, split_files, download_path, Config.SPLIT_SIZE, split_directory)
-        split_files_list = []
-        for root, dirs, files in os.walk(split_directory):
-            for file in files:
-                if file != "fs_manifest.csv":
-                    split_files_list.append(os.path.join(root, file))
-        split_files_list.sort()
-        upload_start = datetime.now()
+        
+        # Split the file (keep extension)
+        # Using split_files from your repo, ensure it splits correctly
+        loop = get_running_loop()
+        await loop.run_in_executor(None, split_files, download_path, Config.SPLIT_SIZE, split_directory)
+        
+        # Get list of split files
+        split_files_list = sorted([os.path.join(split_directory, f) for f in os.listdir(split_directory)])
+        
         for i, split_file in enumerate(split_files_list, 1):
-            split_filename = os.path.basename(split_file)
-            split_description = f"{description} - Part {i}/{len(split_files_list)}"
-            await usermsg.edit_text(f"{Translation.UPLOAD_START}\n\nUploading part {i}/{len(split_files_list)}: {split_filename}")
-            await send_splitted_file(bot, update, tg_send_type, thumb_image_path, split_file, tmp_directory, split_description, usermsg)
-        upload_end = datetime.now()
-        upload_time = (upload_end - upload_start).seconds
-        await usermsg.edit_text(Translation.AFTER_SUCCESSFUL_UPLOAD_MSG_WITH_TS.format(download_time, upload_time))
+            part_name = f"{filename}.part{i}"
+            # Rename to keep extension (e.g., video.mp4.part1)
+            new_path = os.path.join(split_directory, part_name)
+            os.rename(split_file, new_path)
+            
+            await usermsg.edit_text(f"🚀 Uploading part {i}/{len(split_files_list)}...")
+            
+            # Upload with progress
+            await send_splitted_file(bot, update, "doc", None, new_path, tmp_directory, part_name, usermsg)
+            
+        await usermsg.edit_text("🎉 All parts uploaded successfully!")
     except Exception as e:
-        logger.error(f"Error handling large file: {e}")
-        await usermsg.edit_text(f"{Translation.ERROR_UPLOAD_FAILED}\n\nError: {str(e)}")
+        logger.error(f"Large file error: {e}")
+        await usermsg.edit_text(f"❌ Upload failed: {str(e)}")
 
-async def handle_normal_file(bot, update, usermsg, download_path, tmp_directory, tg_send_type, thumb_image_path, description, download_time):
+async def handle_normal_file(bot, update, usermsg, download_path, tmp_directory, filename):
     try:
-        await usermsg.edit_text(Translation.UPLOAD_START)
-        upload_start = datetime.now()
-        await send_file(bot, update, tg_send_type, thumb_image_path, download_path, tmp_directory, description, usermsg)
-        upload_end = datetime.now()
-        upload_time = (upload_end - upload_start).seconds
-        await usermsg.edit_text(Translation.AFTER_SUCCESSFUL_UPLOAD_MSG_WITH_TS.format(download_time, upload_time))
+        await usermsg.edit_text("🚀 Uploading to Telegram...")
+        await send_file(bot, update, "doc", None, download_path, tmp_directory, filename, usermsg)
+        await usermsg.edit_text("🎉 File uploaded successfully!")
     except Exception as e:
-        logger.error(f"Error handling normal file: {e}")
-        await usermsg.edit_text(f"{Translation.ERROR_UPLOAD_FAILED}\n\nError: {str(e)}")
+        logger.error(f"Normal file error: {e}")
+        await usermsg.edit_text(f"❌ Upload failed: {str(e)}")
