@@ -12,3 +12,4 @@ python-dotenv
 feedparser
 filesplit
 git+https://github.com/odwyersoftware/mega.py
+mega.py
