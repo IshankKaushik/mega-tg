@@ -1,6 +1,5 @@
 import logging
 import asyncio
-import subprocess
 import os
 import shutil
 import time
@@ -25,7 +24,6 @@ from translation import Translation
 
 import pyrogram
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup
 
 # Set pyrogram logging level
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
@@ -39,104 +37,71 @@ active_downloads = {}
 download_semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_DOWNLOADS)
 
 class MegaDownloader:
-    """Reliable Mega downloader using only megatools"""
+    """Reliable Mega downloader using pure Python (mega.py)"""
     
     def __init__(self):
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
     
     async def get_mega_info(self, url):
-        """Get mega file information using megatools with retry logic"""
+        """Get mega file information using mega.py with a 45s timeout"""
         loop = get_running_loop()
         max_retries = 3
         
         for attempt in range(max_retries):
             try:
-                # 使用 megatools 获取文件信息，增加超时时间和调试输出
-                result = await loop.run_in_executor(
-                    self.executor,
-                    self._get_info_with_megatools,
-                    url
+                # Run mega.py in the background with a strict timeout
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(self.executor, self._get_info_sync, url),
+                    timeout=45.0
                 )
                 if result.get('success'):
                     return result
-                logger.warning(f"Megatools attempt {attempt + 1} failed: {result.get('error')}")
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout fetching info on attempt {attempt + 1}")
             except Exception as e:
-                logger.error(f"Error in get_mega_info attempt {attempt + 1}: {e}")
+                logger.error(f"Error fetching info on attempt {attempt + 1}: {e}")
             
-            # 每次重试前等待 2 秒
             await asyncio.sleep(2)
             
-        return {'success': False, 'error': 'Failed after multiple retries'}
+        return {'success': False, 'error': 'Mega API is taking too long to respond. Try again later.'}
     
-    def _get_info_with_megatools(self, url):
-        """Get file info using megatools command (blocking)"""
+    def _get_info_sync(self, url):
+        """Synchronous mega.py call (runs in thread)"""
         try:
-            # 关键修改：增加 --debug 参数，并将超时时间设为 180 秒
-            result = subprocess.run(
-                ["megadl", "--print-names", "--no-progress", "--debug", url],
-                capture_output=True,
-                text=True,
-                timeout=180
-            )
-            
-            if result.returncode == 0 and result.stdout:
-                lines = result.stdout.strip().split('\n')
-                if lines:
-                    filename = lines[-1].strip()
-                    if filename:
-                        return {
-                            'name': filename,
-                            'size': 0,
-                            'success': True
-                        }
-            
-            # 如果失败，将 stderr 记录到日志中以便排查
-            logger.error(f"Megatools stderr: {result.stderr}")
-            return {'success': False, 'error': 'Could not get file information from megatools'}
-            
-        except subprocess.TimeoutExpired:
-            return {'success': False, 'error': 'Timeout (180s) while getting file info'}
+            from mega import Mega
+            m = Mega().login()
+            file_info = m.get_public_url_info(url)
+            if file_info and 'size' in file_info and 'name' in file_info:
+                return {
+                    'size': int(file_info['size']),
+                    'name': file_info['name'],
+                    'success': True
+                }
         except Exception as e:
-            return {'success': False, 'error': str(e)}
+            logger.error(f"mega.py info error: {e}")
+        return {'success': False, 'error': 'mega.py failed'}
     
-    async def download_with_megatools(self, url, download_path, cred_location=None):
-        """Download using megatools"""
+    async def download_with_mega_py(self, url, download_dir):
+        """Download using mega.py"""
         try:
             loop = get_running_loop()
             await loop.run_in_executor(
                 self.executor,
-                self._download_megatools,
+                self._download_sync,
                 url,
-                download_path,
-                cred_location
+                download_dir
             )
             return True
         except Exception as e:
-            logger.error(f"Megatools download failed: {e}")
+            logger.error(f"mega.py download failed: {e}")
             raise
     
-    def _download_megatools(self, url, download_path, cred_location=None):
-        """Download using megatools (blocking)"""
-        try:
-            cmd = ["megadl", url, "--path", download_path]
-            
-            if cred_location and os.path.exists(cred_location):
-                cmd.extend(["--config", cred_location])
-            
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=Config.DOWNLOAD_TIMEOUT
-            )
-            
-            if result.returncode != 0:
-                raise Exception(f"Megatools failed: {result.stderr}")
-                
-        except subprocess.TimeoutExpired:
-            raise Exception("Download timeout")
-        except Exception as e:
-            raise Exception(f"Megatools error: {str(e)}")
+    def _download_sync(self, url, download_dir):
+        """Synchronous mega.py download (runs in thread)"""
+        from mega import Mega
+        m = Mega().login()
+        # mega.py will download into download_dir and return the file path
+        m.download_url(url, dest_path=download_dir)
 
 # Global downloader instance
 mega_downloader = MegaDownloader()
@@ -184,6 +149,7 @@ async def process_mega_download(bot, update, url, user_id):
             reply_to_message_id=update.id
         )
         
+        # 1. Get Info
         file_info = await mega_downloader.get_mega_info(url)
         if not file_info.get('success'):
             await usermsg.edit_text(f"{Translation.ERROR_INVALID_LINK}\n\nError: {file_info.get('error', 'Unknown error')}")
@@ -204,14 +170,13 @@ async def process_mega_download(bot, update, url, user_id):
         os.makedirs(tmp_directory, exist_ok=True)
         download_path = os.path.join(tmp_directory, filename)
         thumb_image_path = os.path.join(Config.DOWNLOAD_LOCATION, f"{user_id}.jpg")
-        cred_location = os.path.join(Config.CREDENTIALS_LOCATION, "mega.ini")
         
         await usermsg.edit_text(f"<b>📁 File detected:</b> {filename}\n<b>📊 Size:</b> {humanbytes(filesize) if filesize > 0 else 'Unknown'}\n\n{Translation.DOWNLOAD_START}")
         
         start_time = datetime.now()
         
-        # 只使用 megatools 进行下载
-        await mega_downloader.download_with_megatools(url, tmp_directory, cred_location)
+        # 2. Download (using mega.py)
+        await mega_downloader.download_with_mega_py(url, tmp_directory)
         
         if not os.path.exists(download_path):
             await usermsg.edit_text(Translation.ERROR_DOWNLOAD_FAILED)
@@ -221,6 +186,7 @@ async def process_mega_download(bot, update, url, user_id):
         end_download = datetime.now()
         download_time = (end_download - start_time).seconds
         
+        # 3. Upload / Split
         if actual_size > Config.MAX_FILE_SIZE:
             await handle_large_file(bot, update, usermsg, download_path, tmp_directory, filename, tg_send_type, thumb_image_path, description, actual_size, download_time)
         else:
@@ -237,35 +203,29 @@ async def process_mega_download(bot, update, url, user_id):
             except Exception as e:
                 logger.warning(f"Could not cleanup directory {tmp_directory}: {e}")
 
-# ... (handle_large_file 和 handle_normal_file 函数保持不变)
+# ... (Keep handle_large_file and handle_normal_file exactly as they are) ...
 async def handle_large_file(bot, update, usermsg, download_path, tmp_directory, filename, tg_send_type, thumb_image_path, description, file_size, download_time):
-    """Handle files larger than 2GB"""
     try:
         await usermsg.edit_text(f"<b>📊 Detected Size:</b> {humanbytes(file_size)}\n\n{Translation.INFO_SPLITTING_FILE}")
         split_directory = os.path.join(tmp_directory, "split")
         os.makedirs(split_directory, exist_ok=True)
-        
         if tg_send_type == "vid":
             await split_video_files(download_path, Config.SPLIT_SIZE, split_directory, filename)
         else:
             loop = get_running_loop()
             await loop.run_in_executor(None, split_files, download_path, Config.SPLIT_SIZE, split_directory)
-        
         split_files_list = []
         for root, dirs, files in os.walk(split_directory):
             for file in files:
                 if file != "fs_manifest.csv":
                     split_files_list.append(os.path.join(root, file))
-        
         split_files_list.sort()
         upload_start = datetime.now()
-        
         for i, split_file in enumerate(split_files_list, 1):
             split_filename = os.path.basename(split_file)
             split_description = f"{description} - Part {i}/{len(split_files_list)}"
             await usermsg.edit_text(f"{Translation.UPLOAD_START}\n\nUploading part {i}/{len(split_files_list)}: {split_filename}")
             await send_splitted_file(bot, update, tg_send_type, thumb_image_path, split_file, tmp_directory, split_description, usermsg)
-        
         upload_end = datetime.now()
         upload_time = (upload_end - upload_start).seconds
         await usermsg.edit_text(Translation.AFTER_SUCCESSFUL_UPLOAD_MSG_WITH_TS.format(download_time, upload_time))
@@ -274,7 +234,6 @@ async def handle_large_file(bot, update, usermsg, download_path, tmp_directory, 
         await usermsg.edit_text(f"{Translation.ERROR_UPLOAD_FAILED}\n\nError: {str(e)}")
 
 async def handle_normal_file(bot, update, usermsg, download_path, tmp_directory, tg_send_type, thumb_image_path, description, download_time):
-    """Handle normal sized files"""
     try:
         await usermsg.edit_text(Translation.UPLOAD_START)
         upload_start = datetime.now()
