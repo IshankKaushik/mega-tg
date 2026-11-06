@@ -47,57 +47,75 @@ class MegaDownloader:
     
     def _get_info_sync(self, url):
         try:
-            from mega import Mega
-            m = Mega().login()
-            file_info = m.get_public_url_info(url)
-            if file_info and 'size' in file_info and 'name' in file_info:
-                return {
-                    'size': int(file_info['size']),
-                    'name': file_info['name'],
-                    'success': True
-                }
+            # Use megatools to get file info
+            result = subprocess.run(
+                ["megadl", "--print-names", "--no-progress", url],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0 and result.stdout:
+                lines = result.stdout.strip().split('\n')
+                if lines:
+                    filename = lines[-1].strip()
+                    if filename:
+                        return {'name': filename, 'size': 0, 'success': True}
         except Exception as e:
-            logger.error(f"mega.py info error: {e}")
-        return {'success': False, 'error': 'mega.py failed'}
+            logger.error(f"megatools info error: {e}")
+        return {'success': False, 'error': 'Could not get file info from megatools'}
 
     def _download_sync(self, url, download_dir):
-        """Uses mega.py to download and DECRYPT the file properly"""
-        from mega import Mega
-        if Config.Mega_email and Config.Mega_email != "None":
-            m = Mega().login(Config.Mega_email, Config.Mega_password)
-        else:
-            m = Mega().login()
-        return m.download_url(url, dest_path=download_dir)
+        """Uses megatools to download the file (very stable)"""
+        process = subprocess.Popen(
+            ["megadl", url, "--path", download_dir],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        for line in process.stdout:
+            logger.info(f"megadl: {line.strip()}")
+        process.wait()
+        if process.returncode != 0:
+            raise Exception(f"megadl failed with code {process.returncode}")
+        
+        # Find the downloaded file (it will be the largest file in the directory)
+        files = os.listdir(download_dir)
+        if not files:
+            raise Exception("Download failed: no files found")
+        
+        file_paths = [os.path.join(download_dir, f) for f in files]
+        file_paths.sort(key=os.path.getsize, reverse=True)
+        return file_paths[0]
 
     async def download_with_progress(self, url, download_dir, message, start_time, total_size):
         loop = get_running_loop()
-        
-        # Start download in background thread
         future = loop.run_in_executor(self.executor, self._download_sync, url, download_dir)
         
         last_update_time = time.time()
         
-        # While the download thread is running, check the file size on disk for progress
+        # Monitor the file size on disk for live progress
         while not future.done():
             try:
                 files = os.listdir(download_dir)
                 current_size = 0
                 if files:
                     file_paths = [os.path.join(download_dir, f) for f in files]
-                    file_paths.sort(key=os.path.getmtime, reverse=True)
-                    if file_paths:
-                        current_size = os.path.getsize(file_paths[0])
+                    file_paths.sort(key=os.path.getsize, reverse=True)
+                    current_size = os.path.getsize(file_paths[0])
                 
-                if time.time() - last_update_time > 5 and total_size > 0:
-                    percentage = (current_size / total_size) * 100
-                    speed = current_size / (time.time() - start_time)
-                    eta = (total_size - current_size) / speed if speed > 0 else 0
-                    
-                    progress_str = f"📥 **Downloading...**\n\n"
-                    progress_str += f"**Progress:** {percentage:.1f}%\n"
-                    progress_str += f"**Size:** {humanbytes(current_size)} / {humanbytes(total_size)}\n"
-                    progress_str += f"**Speed:** {humanbytes(speed)}/s\n"
-                    progress_str += f"**ETA:** {TimeFormatter(eta)}"
+                if time.time() - last_update_time > 5:
+                    # If we don't know the total size, just show downloaded size
+                    if total_size > 0:
+                        percentage = (current_size / total_size) * 100
+                        speed = current_size / (time.time() - start_time)
+                        eta = (total_size - current_size) / speed if speed > 0 else 0
+                        
+                        progress_str = f"📥 **Downloading...**\n\n"
+                        progress_str += f"**Progress:** {percentage:.1f}%\n"
+                        progress_str += f"**Size:** {humanbytes(current_size)} / {humanbytes(total_size)}\n"
+                        progress_str += f"**Speed:** {humanbytes(speed)}/s\n"
+                        progress_str += f"**ETA:** {TimeFormatter(eta)}"
+                    else:
+                        speed = current_size / (time.time() - start_time)
+                        progress_str = f"📥 **Downloading...**\n\n"
+                        progress_str += f"**Downloaded:** {humanbytes(current_size)}\n"
+                        progress_str += f"**Speed:** {humanbytes(speed)}/s"
                     
                     try:
                         await message.edit_text(progress_str)
@@ -109,7 +127,6 @@ class MegaDownloader:
             
             await asyncio.sleep(2)
             
-        # Return the final path when done
         file_path = await future
         return file_path
 
@@ -161,7 +178,7 @@ async def process_mega_download(bot, update, url, user_id):
         tmp_directory = os.path.join(Config.DOWNLOAD_LOCATION, str(user_id))
         os.makedirs(tmp_directory, exist_ok=True)
         
-        await usermsg.edit_text(f"📁 **File:** {filename}\n📊 **Size:** {humanbytes(filesize)}\n\n⏳ Starting download...")
+        await usermsg.edit_text(f"📁 **File:** {filename}\n📊 **Size:** {humanbytes(filesize) if filesize > 0 else 'Unknown'}\n\n⏳ Starting download...")
         
         start_time = time.time()
         download_path = await mega_downloader.download_with_progress(url, tmp_directory, usermsg, start_time, filesize)
@@ -195,7 +212,6 @@ async def handle_large_file(bot, update, usermsg, download_path, tmp_directory, 
         split_directory = os.path.join(tmp_directory, "split")
         os.makedirs(split_directory, exist_ok=True)
         
-        # Determine file type based on extension
         tg_send_type = "vid" if any(ext in filename.lower() for ext in ['.mp4', '.mkv', '.avi', '.mov']) else "doc"
         
         loop = get_running_loop()
@@ -211,11 +227,11 @@ async def handle_large_file(bot, update, usermsg, download_path, tmp_directory, 
                 split_files_list.append(os.path.join(split_directory, f))
         split_files_list.sort()
 
+        # i = 0 is here to prevent the error you saw earlier
         i = 0
         for i, split_file in enumerate(split_files_list, 1):
             part_name = os.path.basename(split_file)
             await usermsg.edit_text(f"🚀 Uploading part {i}/{len(split_files_list)}: {part_name}...")
-            # Thumbnail can be None
             await send_splitted_file(bot, update, tg_send_type, None, split_file, tmp_directory, part_name, usermsg)
             
         await usermsg.edit_text("🎉 All parts uploaded successfully!")
