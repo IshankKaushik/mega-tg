@@ -4,16 +4,14 @@ import subprocess
 import os
 import shutil
 import time
-from datetime import datetime
 from asyncio import get_running_loop
 import concurrent.futures
-import requests
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
 # Import helpers
-from helpers.download_uplaod_helper import send_splitted_file, send_file, humanbytes, progress_for_pyrogram, TimeFormatter
+from helpers.download_uplaod_helper import send_splitted_file, send_file, humanbytes, TimeFormatter
 from helpers.files_spliiting import split_files, split_video_files
 
 # Import configuration
@@ -62,55 +60,58 @@ class MegaDownloader:
             logger.error(f"mega.py info error: {e}")
         return {'success': False, 'error': 'mega.py failed'}
 
-    async def download_with_progress(self, url, download_dir, message, start_time):
-        """Streams the download and updates Telegram message"""
+    def _download_sync(self, url, download_dir):
+        """Uses mega.py to download and DECRYPT the file properly"""
+        from mega import Mega
+        if Config.Mega_email and Config.Mega_email != "None":
+            m = Mega().login(Config.Mega_email, Config.Mega_password)
+        else:
+            m = Mega().login()
+        return m.download_url(url, dest_path=download_dir)
+
+    async def download_with_progress(self, url, download_dir, message, start_time, total_size):
         loop = get_running_loop()
-        try:
-            from mega import Mega
-            
-            # USE MEGA CREDENTIALS TO BYPASS 500KB/s SPEED LIMIT
-            if Config.Mega_email and Config.Mega_email != "None":
-                m = Mega().login(Config.Mega_email, Config.Mega_password)
-            else:
-                m = Mega().login()
+        
+        # Start download in background thread
+        future = loop.run_in_executor(self.executor, self._download_sync, url, download_dir)
+        
+        last_update_time = time.time()
+        
+        # While the download thread is running, check the file size on disk for progress
+        while not future.done():
+            try:
+                files = os.listdir(download_dir)
+                current_size = 0
+                if files:
+                    file_paths = [os.path.join(download_dir, f) for f in files]
+                    file_paths.sort(key=os.path.getmtime, reverse=True)
+                    if file_paths:
+                        current_size = os.path.getsize(file_paths[0])
                 
-            file_info = m.get_public_url_info(url)
-            download_url = m.get_download_url(file_info)
+                if time.time() - last_update_time > 5 and total_size > 0:
+                    percentage = (current_size / total_size) * 100
+                    speed = current_size / (time.time() - start_time)
+                    eta = (total_size - current_size) / speed if speed > 0 else 0
+                    
+                    progress_str = f"📥 **Downloading...**\n\n"
+                    progress_str += f"**Progress:** {percentage:.1f}%\n"
+                    progress_str += f"**Size:** {humanbytes(current_size)} / {humanbytes(total_size)}\n"
+                    progress_str += f"**Speed:** {humanbytes(speed)}/s\n"
+                    progress_str += f"**ETA:** {TimeFormatter(eta)}"
+                    
+                    try:
+                        await message.edit_text(progress_str)
+                    except Exception:
+                        pass
+                    last_update_time = time.time()
+            except Exception as e:
+                logger.error(f"Progress update error: {e}")
             
-            file_path = os.path.join(download_dir, file_info['name'])
+            await asyncio.sleep(2)
             
-            with requests.get(download_url, stream=True, timeout=300) as r:
-                r.raise_for_status()
-                total_size = int(r.headers.get('content-length', 0))
-                downloaded = 0
-                last_update_time = time.time()
-                
-                with open(file_path, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=1024*1024):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            
-                            if time.time() - last_update_time > 5:
-                                percentage = (downloaded / total_size) * 100 if total_size > 0 else 0
-                                speed = downloaded / (time.time() - start_time)
-                                eta = (total_size - downloaded) / speed if speed > 0 else 0
-                                
-                                progress_str = f"📥 **Downloading...**\n\n"
-                                progress_str += f"**Progress:** {percentage:.1f}%\n"
-                                progress_str += f"**Size:** {humanbytes(downloaded)} / {humanbytes(total_size)}\n"
-                                progress_str += f"**Speed:** {humanbytes(speed)}/s\n"
-                                progress_str += f"**ETA:** {TimeFormatter(eta)}"
-                                
-                                try:
-                                    await message.edit_text(progress_str)
-                                except Exception:
-                                    pass
-                                last_update_time = time.time()
-            return file_path
-        except Exception as e:
-            logger.error(f"Download failed: {e}")
-            raise
+        # Return the final path when done
+        file_path = await future
+        return file_path
 
 mega_downloader = MegaDownloader()
 
@@ -163,15 +164,14 @@ async def process_mega_download(bot, update, url, user_id):
         await usermsg.edit_text(f"📁 **File:** {filename}\n📊 **Size:** {humanbytes(filesize)}\n\n⏳ Starting download...")
         
         start_time = time.time()
-        download_path = await mega_downloader.download_with_progress(url, tmp_directory, usermsg, start_time)
+        download_path = await mega_downloader.download_with_progress(url, tmp_directory, usermsg, start_time, filesize)
         
-        if not os.path.exists(download_path):
+        if not download_path or not os.path.exists(download_path):
             await usermsg.edit_text("❌ Download failed. File not found.")
             return
         
         actual_size = os.path.getsize(download_path)
         
-        # If file is larger than 2GB, split it into playable parts
         if actual_size > Config.MAX_FILE_SIZE:
             await handle_large_file(bot, update, usermsg, download_path, tmp_directory, filename, actual_size)
         else:
@@ -195,19 +195,16 @@ async def handle_large_file(bot, update, usermsg, download_path, tmp_directory, 
         split_directory = os.path.join(tmp_directory, "split")
         os.makedirs(split_directory, exist_ok=True)
         
-        # Determine file type
+        # Determine file type based on extension
         tg_send_type = "vid" if any(ext in filename.lower() for ext in ['.mp4', '.mkv', '.avi', '.mov']) else "doc"
         
         loop = get_running_loop()
         
         if tg_send_type == "vid":
-            # Use your custom split_video_files function
             await split_video_files(download_path, Config.SPLIT_SIZE, split_directory, filename)
         else:
-            # Fallback to raw split for non-videos (like zips)
             await loop.run_in_executor(None, split_files, download_path, Config.SPLIT_SIZE, split_directory)
         
-        # Get list of split files
         split_files_list = []
         for f in os.listdir(split_directory):
             if f != "fs_manifest.csv":
@@ -217,8 +214,7 @@ async def handle_large_file(bot, update, usermsg, download_path, tmp_directory, 
         for i, split_file in enumerate(split_files_list, 1):
             part_name = os.path.basename(split_file)
             await usermsg.edit_text(f"🚀 Uploading part {i}/{len(split_files_list)}: {part_name}...")
-            
-            # Upload as video (if it's a video) or document
+            # Thumbnail can be None
             await send_splitted_file(bot, update, tg_send_type, None, split_file, tmp_directory, part_name, usermsg)
             
         await usermsg.edit_text("🎉 All parts uploaded successfully!")
