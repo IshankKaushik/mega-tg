@@ -210,7 +210,8 @@ async def handle_large_file(bot, update, usermsg, download_path, tmp_directory, 
             if f != "fs_manifest.csv":
                 split_files_list.append(os.path.join(split_directory, f))
         split_files_list.sort()
-        
+
+        i = 0
         for i, split_file in enumerate(split_files_list, 1):
             part_name = os.path.basename(split_file)
             await usermsg.edit_text(f"🚀 Uploading part {i}/{len(split_files_list)}: {part_name}...")
